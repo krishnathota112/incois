@@ -95,14 +95,14 @@ async def load_bio_index():
     DATE_SORTED_PROFILES_BIO = sorted(data, key=lambda x: x['date'])
 
 async def load_index():
-    """Loads the index file into memory and sorts it for binary search."""
-    global CACHED_PROFILES, DATE_SORTED_PROFILES
-    
-    if CACHED_PROFILES:
+    """Loads the core index file into memory and sorts it for binary search."""
+    global CACHED_PROFILES_CORE, DATE_SORTED_PROFILES_CORE
+
+    if CACHED_PROFILES_CORE:
         return
-    
-    # Check local first
+
     content = ""
+
     if os.path.exists(LOCAL_INDEX_PATH):
         with open(LOCAL_INDEX_PATH, 'r', encoding='utf-8') as f:
             content = f.read()
@@ -110,13 +110,14 @@ async def load_index():
         async with httpx.AsyncClient() as client:
             resp = await client.get(REMOTE_INDEX_URL)
             content = resp.text
-            
-    # Parse CSV-like structure
+
     lines = [line for line in content.splitlines() if not line.startswith('#') and 'file,' not in line]
-    
+
     data = []
+
     for line in lines:
         parts = line.split(',')
+
         if len(parts) >= 8:
             try:
                 data.append({
@@ -131,26 +132,35 @@ async def load_index():
                 })
             except ValueError:
                 continue
-            
-    CACHED_PROFILES = data
-    DATE_SORTED_PROFILES = sorted(data, key=lambda x: x['date'])
 
+    CACHED_PROFILES_CORE = data
+    DATE_SORTED_PROFILES_CORE = sorted(data, key=lambda x: x['date'])
 @app.on_event("startup")
 async def startup_event():
     await load_index()
+    await load_bio_index()
+from datetime import datetime
 
-def binary_search_date_range(start_date, end_date,dataset='core'):
-    """Effectively finds the slice of profiles within the date range."""
-    start_str = start_date.replace('-', '') + "000000"
-    end_str = end_date.replace('-', '') + "235959"
-    if dataset=='bio':
-        profiles=DATE_SORTED_PROFILES_BIO
+from datetime import datetime
+
+def binary_search_date_range(start_date, end_date, dataset='core'):
+
+    start_str = datetime.strptime(start_date, "%Y-%m-%d").strftime("%Y%m%d") + "000000"
+    end_str = datetime.strptime(end_date, "%Y-%m-%d").strftime("%Y%m%d") + "235959"
+
+    if dataset == 'bio':
+        profiles = DATE_SORTED_PROFILES_BIO
     else:
-        profiles=DATE_SORTED_PROFILES
-    dates = [x['date'] for x in DATE_SORTED_PROFILES]
+        profiles = DATE_SORTED_PROFILES_CORE
+
+    dates = [x['date'] for x in profiles]
+
     left_idx = bisect.bisect_left(dates, start_str)
     right_idx = bisect.bisect_right(dates, end_str)
-    return DATE_SORTED_PROFILES[left_idx:right_idx]
+
+    return profiles[left_idx:right_idx]
+
+    return profiles[left_idx:right_idx]
 async def download_bio_netcdf(file_path):
     "Download Bio NetCDF file and saves it to the downloads directory."
     url=f"https://data.argo.ifremer.fr/dac/{file_path}"
@@ -335,10 +345,14 @@ async def websocket_endpoint(websocket: WebSocket):
         params_obj = ParamsObj(params)
 
         await websocket.send_json({"type": "log", "message": "Initializing Search..."})
-        await load_index()
+        #await load_index()
         
         # 1. Date Filter
-        candidates = binary_search_date_range(params['startDate'], params['endDate'])
+        candidates = binary_search_date_range(
+            params['startDate'], 
+            params['endDate'],
+            params['type'])
+
         await websocket.send_json({"type": "log", "message": f"Found {len(candidates)} profiles in date range."})
         
         # 2. Geo Filter
@@ -361,7 +375,12 @@ async def websocket_endpoint(websocket: WebSocket):
                 msg = f"[{i+1}/{len(selection)}] Processing {profile['file']}..."
                 await websocket.send_json({"type": "log", "message": msg})
                 
-                local_path = await download_netcdf(profile['file'])
+                #local_path = await download_netcdf(profile['file'])
+                if params['type']=='bio':
+                    local_path=await download_bio_netcdf(profile['file'])
+                else:
+                    local_path=await download_netcdf(profile['file'])
+
                 extracted = process_netcdf(local_path, params_obj)
                 
                 filename = os.path.basename(profile['file'])
