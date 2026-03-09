@@ -24,10 +24,10 @@ app.add_middleware(
 )
 
 # Configuration
-LOCAL_INDEX_PATH = '../ar_index_global_prof.txt'
+LOCAL_INDEX_PATH = 'ar_index_global_prof.txt'
 REMOTE_INDEX_URL = 'https://data-argo.ifremer.fr/ar_index_global_prof.txt'
 DOWNLOADS_DIR = 'downloads'
-BIO_INDEX_PATH='../argo_bio-profile_index.txt'
+BIO_INDEX_PATH = 'argo_bio-profile_index.txt'
 # Ensure downloads directory exists
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
@@ -67,16 +67,16 @@ async def load_bio_index():
             content = f.read()
     else:
         async with httpx.AsyncClient() as client:
-            resp = await client.get('https://data-argo.ifremer.fr/dac/argo_bio-profile_index.txt')
+            resp = await client.get('https://data-argo.ifremer.fr/dac/argo_bio-profile_index.txt', timeout=600.0)
             content = resp.text
 
-    # Parse the bio index content
+    # Parse the bio index content (10-column format: file,date,lat,lon,ocean,profiler_type,institution,parameters,parameter_data_mode,date_update)
     lines = [line for line in content.splitlines() if not line.startswith('#') and 'file,' not in line]
 
     data = []
     for line in lines:
         parts = line.split(',')
-        if len(parts) >= 8:
+        if len(parts) >= 7:
             try:
                 data.append({
                     'file': parts[0],
@@ -86,13 +86,14 @@ async def load_bio_index():
                     'ocean': parts[4],
                     'profiler_type': parts[5],
                     'institution': parts[6],
-                    'date_update': parts[7]
+                    'date_update': parts[-1] if len(parts) >= 10 else parts[7] if len(parts) >= 8 else ''
                 })
             except ValueError:
                 continue
 
     CACHED_PROFILES_BIO = data
     DATE_SORTED_PROFILES_BIO = sorted(data, key=lambda x: x['date'])
+    print(f'Loaded {len(CACHED_PROFILES_BIO)} bio profiles')
 
 async def load_index():
     """Loads the core index file into memory and sorts it for binary search."""
@@ -108,7 +109,7 @@ async def load_index():
             content = f.read()
     else:
         async with httpx.AsyncClient() as client:
-            resp = await client.get(REMOTE_INDEX_URL)
+            resp = await client.get(REMOTE_INDEX_URL, timeout=600.0)
             content = resp.text
 
     lines = [line for line in content.splitlines() if not line.startswith('#') and 'file,' not in line]
@@ -135,13 +136,12 @@ async def load_index():
 
     CACHED_PROFILES_CORE = data
     DATE_SORTED_PROFILES_CORE = sorted(data, key=lambda x: x['date'])
+from datetime import datetime
+
 @app.on_event("startup")
 async def startup_event():
     await load_index()
     await load_bio_index()
-from datetime import datetime
-
-from datetime import datetime
 
 def binary_search_date_range(start_date, end_date, dataset='core'):
 
@@ -159,11 +159,9 @@ def binary_search_date_range(start_date, end_date, dataset='core'):
     right_idx = bisect.bisect_right(dates, end_str)
 
     return profiles[left_idx:right_idx]
-
-    return profiles[left_idx:right_idx]
 async def download_bio_netcdf(file_path):
     "Download Bio NetCDF file and saves it to the downloads directory."
-    url=f"https://data.argo.ifremer.fr/dac/{file_path}"
+    url=f"https://data-argo.ifremer.fr/dac/{file_path}"
     filename=os.path.basename(file_path)
     local_path=os.path.join(DOWNLOADS_DIR, filename)
     if os.path.exists(local_path):
@@ -205,12 +203,19 @@ def process_netcdf(file_path, params):
         vars_to_extract = {}
         flags_to_extract = {}
         
-        # Get all data variables (excluding dimensions and coordinates)
+        # Get measurement variables that share PRES dimensions (N_PROF, N_LEVELS)
+        # This excludes per-profile metadata (CYCLE_NUMBER, LATITUDE, etc.) and
+        # history variables that have different dimensions
+        pres_dims = ds['PRES'].dims  # e.g. ('N_PROF', 'N_LEVELS')
         for var_name in ds.data_vars:
             if var_name not in ['PRES'] and not var_name.endswith('_QC'):
                 try:
-                    var_data = ds[var_name].values
-                    if var_data.size > 0:  # Only include non-empty variables
+                    var = ds[var_name]
+                    var_data = var.values
+                    # Only include numeric variables with same dims as PRES
+                    if (var_data.size > 0 and 
+                        var_data.dtype.kind in ('f', 'i', 'u') and
+                        var.dims == pres_dims):
                         vars_to_extract[var_name] = var_data
                         qc_key = f"{var_name}_QC"
                         if qc_key in ds:
@@ -251,7 +256,7 @@ def process_netcdf(file_path, params):
                                 else:
                                     val = np.nan
                                 row[vname] = float(val) if not np.isnan(val) else ''
-                            except (IndexError, ValueError):
+                            except (IndexError, ValueError, TypeError):
                                 row[vname] = ''
                         
                         for qname, qdata in flags_to_extract.items():
@@ -293,7 +298,7 @@ def process_netcdf(file_path, params):
                                     else:
                                         val = np.nan
                                     row[vname] = float(val) if not np.isnan(val) else ''
-                                except (IndexError, ValueError):
+                                except (IndexError, ValueError, TypeError):
                                     row[vname] = ''
                             
                             for qname, qdata in flags_to_extract.items():
@@ -334,10 +339,12 @@ async def websocket_endpoint(websocket: WebSocket):
         data = await websocket.receive_text()
         req_dict = json.loads(data)
         
-        # Manually reconstruct objects (Pydantic models need explicit dict unpacking if nested)
-        # But simpler to just use dict access here for safety
         bounds = req_dict['bounds']
         params = req_dict['params']
+        
+        # Ensure numeric types are properly converted (they arrive as strings from JSON)
+        params['minDepth'] = float(params.get('minDepth', 0))
+        params['maxDepth'] = float(params.get('maxDepth', 2000))
         
         # Params object wrapper for helper functions
         class ParamsObj:
@@ -410,21 +417,50 @@ async def websocket_endpoint(websocket: WebSocket):
         df = pd.DataFrame(all_results)
         
         # Proper Column Ordering with enhanced metadata
-        first_cols = ['Platform', 'Cycle', 'Date', 'Latitude', 'Longitude', 'depth']
-        # Get all parameter columns (excluding QC and metadata)
-        param_cols = [c for c in df.columns if c not in first_cols and 'QC' not in c and c not in ['File', 'Institution', 'Ocean']]
-        qc_cols = [c for c in df.columns if 'QC' in c]
-        meta_cols = ['Institution', 'Ocean', 'File'] if any(c in df.columns for c in ['Institution', 'Ocean', 'File']) else ['File']
-        
-        final_cols = first_cols + param_cols + qc_cols + meta_cols
+        if params.get('type') == 'bio':
+            # Priority order for BGC parameters as shown in UI
+            bgc_priority = [
+                'CHLA', 'CHLA_ADJUSTED', 
+                'DOXY', 'DOXY_ADJUSTED', 
+                'NITRATE', 'NITRATE_ADJUSTED', 
+                'PH', 'PH_ADJUSTED', 
+                'BBP700', 'BBP700_ADJUSTED', 
+                'IRRADIANCE', 'IRRADIANCE_ADJUSTED',
+                'TEMP', 'TEMP_ADJUSTED',
+                'PSAL', 'PSAL_ADJUSTED',
+                'PRES', 'PRES_ADJUSTED'
+            ]
+            first_cols = ['Platform', 'Cycle', 'Date', 'Latitude', 'Longitude', 'depth']
+            
+            # Identify which priority cols actually exist
+            available_priority = [c for c in bgc_priority if c in df.columns]
+            
+            # Other numeric columns not in priority list
+            other_param_cols = [c for c in df.columns if c not in first_cols and c not in available_priority and 'QC' not in c and c not in ['File', 'Institution', 'Ocean']]
+            
+            qc_cols = [c for c in df.columns if 'QC' in c]
+            meta_cols = ['Institution', 'Ocean', 'File']
+            
+            final_cols = first_cols + available_priority + other_param_cols + qc_cols + meta_cols
+        else:
+            # Standard Core Argo ordering
+            first_cols = ['Platform', 'Cycle', 'Date', 'Latitude', 'Longitude', 'depth']
+            param_cols = [c for c in df.columns if c not in first_cols and 'QC' not in c and c not in ['File', 'Institution', 'Ocean']]
+            qc_cols = [c for c in df.columns if 'QC' in c]
+            meta_cols = ['Institution', 'Ocean', 'File']
+            final_cols = first_cols + param_cols + qc_cols + meta_cols
         
         # Handle missing cols if any
         existing_cols = [c for c in final_cols if c in df.columns]
         df = df[existing_cols]
         
+        # Drop columns that are entirely empty (all blank or NaN)
+        df.replace('', np.nan, inplace=True)
+        df.dropna(axis=1, how='all', inplace=True)
+        
         # Rename for niceness
         df.rename(columns={'depth': 'Depth (dbar)'}, inplace=True)
-        
+            
         # CSV String with BOM for Excel
         csv_buffer = io.StringIO()
         df.to_csv(csv_buffer, index=False) # standard encoding
