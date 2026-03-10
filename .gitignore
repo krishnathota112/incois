@@ -43,8 +43,8 @@ venv.bak/
 
 # === Data / downloads (optional) ===
 # Uncomment if you want to avoid committing large NetCDF data files
-# backend/downloads/
-# *.nc
+backend/downloads/
+.nc
 
 # === Logs / runtime ===
 *.log
